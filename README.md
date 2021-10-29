@@ -2,23 +2,23 @@
 
 ### Introduction
 
+[dbt](https://docs.getdbt.com/docs/introduction) is a data transformation workflow tool that lets teams quickly and collaboratively deploy analytics code, following software engineering best practices like modularity, CI/CD, testing, and documentation. It enables anyone who knows SQL to build production-grade data pipelines.
+
 One frequently asked question in the context of using `dbt` tool is:
 
 > Can I connect my dbt project to two databases?
 
 (see the answered [question](https://docs.getdbt.com/faqs/connecting-to-two-dbs-not-allowed) on the dbt website).
 
-**tldr;** `dbt` stands for transformation as in `T` within `ELT`  pipelines, it doesn't move data from source to a warehouse.
+**tldr;** `dbt` stands for transformation as in `T` within `ELT` pipelines, it doesn't move data from source to a warehouse.
 
-The creators of the `dbt` tool have added however support for handling such scenarios via
-[dbt-presto](https://github.com/dbt-labs/dbt-presto) plugin.
+`dbt-trino` adapter uses [Trino](https://trino.io/) as a underlying query engine to perform query federation across disperse data sources. Trino connects to multiple and diverse data sources ([available connectors](https://trino.io/docs/current/connector.html)) via one dbt connection and process SQL queries at scale. Transformations defined in dbt are passed to Trino which handles these SQL transformation queries and translates them to queries specific to the systems it connects to create tables or views and manipulate data.
 
-This repository represents a fork of the [dbt-presto](https://github.com/dbt-labs/dbt-presto) with slight
-adaptations to make it work with [Trino](https://trino.io/) SQL compute engine.
+This repository represents a fork of the [dbt-presto](https://github.com/dbt-labs/dbt-presto) with adaptations to make it work with Trino.
 
 ### Compatibility
 
-This dbt plugin has been tested against `trino` version `360`.
+This dbt plugin has been tested against `trino` version `363`.
 
 ### Installation
 
@@ -37,6 +37,9 @@ A dbt profile can be configured to run against Trino using the following configu
 | method  | The Trino authentication method to use | Optional (default is `none`)  | `none` or `kerberos` |
 | user  | Username for authentication | Required  | `commander` |
 | password  | Password for authentication | Optional (required if `method` is `ldap` or `kerberos`)  | `none` or `abc123` |
+| http_headers | HTTP Headers to send alongside requests to Trino, specified as a yaml dictionary of (header, value) pairs. | Optional | `X-Trino-Client-Info: dbt-trino` |
+| http_scheme | The HTTP scheme to use for requests to Trino | Optional (default is `http`, or `https` for `method: kerberos` and `method: ldap`) | `https` or `http`
+| session_properties | Sets Trino session properties used in the connection | Optional | `query_max_run_time: 5d`
 | database  | Specify the database to build models into | Required  | `analytics` |
 | schema  | Specify the schema to build models into. Note: it is not recommended to use upper or mixed case schema names | Required | `public` |
 | host    | The hostname to connect to | Required | `127.0.0.1`  |
@@ -46,6 +49,7 @@ A dbt profile can be configured to run against Trino using the following configu
 
 
 **Example profiles.yml entry:**
+
 ```
 my-trino-db:
   target: dev
@@ -58,15 +62,27 @@ my-trino-db:
       database: analytics
       schema: public
       threads: 8
+      http_scheme: http
+      session_properties:
+        query_max_run_time: 5d
+        exchange_compression: True
 ```
+
+
+For reference on which session properties can be set on the the dbt profile do execute
+
+```sql
+SHOW SESSION;
+```
+
+on your Trino instance.
 
 ### Usage Notes
 
 #### Supported Functionality
 Due to the nature of Trino, not all core `dbt` functionality is supported.
-The following features of dbt are not implemented on Trino:
-- Archival
-- Incremental models
+The following features of dbt are not implemented in `dbt-trino`:
+- Snapshot
 
 Also, note that upper or mixed case schema names will cause catalog queries to fail. 
 Please only use lower case schema names with this adapter.
@@ -83,11 +99,73 @@ hive.allow-drop-table=true
 hive.allow-rename-table=true
 ```
 
+#### Incremental models
+
+The incremental strategy currently supported by this adapter is to append new records
+without updating/overwriting any existing data from the target model.
+
+```
+{{
+    config(materialized = 'incremental')
+}}
+```
+
+#### Incremental overwrite on hive models
+
+In case that the target incremental model is being accessed with 
+[hive](https://trino.io/docs/current/connector/hive.html) Trino connector,  an `insert overwrite` 
+functionality can be achieved when using:
+
+```
+<hive-catalog-name>.insert-existing-partitions-behavior=OVERWRITE
+```
+
+setting on the Trino hive connector configuration.
+
+Below is a sample hive profile entry to deal with `OVERWRITE` functionality for the hive connector called `minio`:
+
+```
+trino-incremental-hive:
+  target: dev
+  outputs:
+    dev:
+      type: trino
+      method: none
+      user: admin
+      password:
+      catalog: minio
+      schema: tiny
+      host: localhost
+      port: 8080
+      http_scheme: http
+      session_properties:
+         minio.insert_existing_partitions_behavior: OVERWRITE
+      threads: 1
+```
+
+
+Existing partitions in the target model that match the staged data will be overwritten. 
+The rest of the partitions will be simply appended to the target model.
+
+NOTE that this functionality works on incremental models that use partitioning:
+
+```
+{{
+    config(
+        materialized = 'incremental',
+        properties={
+          "format": "'PARQUET'",
+          "partitioned_by": "ARRAY['day']",
+        }
+    )
+}}
+```
+
 #### Use table properties to configure connector specifics
 
-Trino/Presto connectors use table properties to configure connector specifics.
+Trino connectors use table properties to configure connector specifics.
 
-Check the Presto/Trino connector documentation for more information.
+Check the Trino connector documentation for more information.
 
 ```
 {{
@@ -101,6 +179,14 @@ Check the Presto/Trino connector documentation for more information.
 }}
 ```
 
+#### Generating lineage flow in docs
+
+In order to generate lineage flow in docs use `ref` function in the place of table names in the query. It builts dependencies between models and allows to create DAG with data flow. Refer to examples [here](https://docs.getdbt.com/docs/building-a-dbt-project/building-models#building-dependencies-between-models).
+
+```sh
+dbt docs generate          # generate docs 
+dbt docs serve --port 8081 # starts local server (by default docs server runs on 8080 port, it may cause conflict with Trino in case of local development)
+```
 
 ### Running tests
 Build dbt container locally:
@@ -115,30 +201,6 @@ Run a Trino server locally:
 ./docker/init.bash
 ```
 
-If you see errors while about "inconsistent state" while bringing up Trino,
-you may need to drop and re-create the `public` schema in the hive metastore:
-```
-# Example error
-
-Initialization script hive-schema-2.3.0.postgres.sql
-Error: ERROR: relation "BUCKETING_COLS" already exists (state=42P07,code=0)
-org.apache.hadoop.hive.metastore.HiveMetaException: Schema initialization FAILED! Metastore state would be inconsistent !!
-Underlying cause: java.io.IOException : Schema script failed, errorcode 2
-Use --verbose for detailed stacktrace.
-*** schemaTool failed ***
-```
-
-**Solution:** Drop (or rename) the public schema to allow the init script to recreate the metastore from scratch. **Only run this against a test Trino deployment. Do not run this in production!**
-```sql
--- run this against the hive metastore (port forwarded to 10005 by default)
--- DO NOT RUN THIS IN PRODUCTION!
-
-drop schema public cascade;
-create schema public;
-```
-
-You probably should be slightly less reckless than this.
-
 Run tests against Trino:
 
 ```
@@ -146,20 +208,26 @@ Run tests against Trino:
 ```
 
 Run the locally-built docker image (from docker/dbt/build.sh):
-```
+```sh
 export DBT_PROJECT_DIR=$HOME/... # wherever the dbt project you want to run is
-docker run -it --mount "type=bind,source=$HOME/.dbt/,target=/home/dbt_user/.dbt" --mount="type=bind,source=$DBT_PROJECT_DIR,target=/usr/app" --network dbt-net dbt-trino /bin/bash
+docker run -it --mount "type=bind,source=$HOME/.dbt/,target=/root/.dbt" --mount="type=bind,source=$DBT_PROJECT_DIR,target=/usr/app" --network dbt-net dbt-trino /bin/bash
 ```
 
 ### Running integration tests
 
-Install [dbt-adapter-tests](https://github.com/dbt-labs/dbt-adapter-tests) library to be able to run the dbt tests:
+Install the libraries required for development in order to be able to run the dbt tests:
 
 ```
-pip install pytest-dbt-adapter
+pip install -r dev_requirements.txt
 ```
 
 Run from the base directory of the project the command:
+
+```
+tox
+```
+
+or 
 
 ```
 pytest test/integration/trino.dbtspec
